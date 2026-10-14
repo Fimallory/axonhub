@@ -1,17 +1,60 @@
-# Publish Docker image
-# Copy from new-api 
-# https://github.com/QuantumNous/new-api/blob/main/.github/workflows/docker-image-arm64.yml
-
-name: Publish Docker image
+name: Publish Docker image (unstable)
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build. The sync workflow passes its post-sync commit.
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-docker-unstable
+  cancel-in-progress: false
 
 jobs:
-  build_single_arch:
-    name: Build & push (${{ matrix.arch }}) [native]
+  compute-version:
+    name: Compute unstable version
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.build_version }}
+      date_tag: ${{ steps.version.outputs.date_tag }}
+      sha_tag: ${{ steps.version.outputs.sha_tag }}
+      owner_lc: ${{ steps.version.outputs.owner_lc }}
+      actor_lc: ${{ steps.version.outputs.actor_lc }}
+    steps:
+      - name: Checkout current commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Compute version and image owner
+        id: version
+        run: |
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          ACTOR_LC="${GITHUB_ACTOR,,}"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          DATE="$(date -u +%Y%m%d)"
+          SHORT_SHA="${COMMIT_SHA:0:12}"
+          BUILD_VERSION="unstable-${DATE}-${SHORT_SHA}"
+          DATE_TAG="unstable-${DATE}"
+          SHA_TAG="unstable-${SHORT_SHA}"
+          echo "owner_lc=${OWNER_LC}" >> "$GITHUB_OUTPUT"
+          echo "actor_lc=${ACTOR_LC}" >> "$GITHUB_OUTPUT"
+          echo "build_version=${BUILD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and push (${{ matrix.arch }})
+    needs: [compute-version]
     strategy:
       fail-fast: false
       matrix:
@@ -23,82 +66,72 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-
-    permissions:
-      packages: write
-      contents: read
-
     steps:
-      - name: Check out (shallow)
-        uses: actions/checkout@v7
+      - name: Checkout current commit
+        uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
           fetch-depth: 1
-          persist-credentials: false
 
-      - name: Resolve tag & write VERSION
-        run: |
-          git fetch --tags --force --depth=1
-          TAG=${GITHUB_REF#refs/tags/}
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "$TAG" > internal/build/VERSION
-          echo "Building tag: $TAG for ${{ matrix.arch }}"
+      - name: Write build version
+        run: printf '%s\n' '${{ needs.compute-version.outputs.build_version }}' > internal/build/VERSION
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ needs.compute-version.outputs.actor_lc }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (labels)
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: |
-            looplj/axonhub
-
-      - name: Build & push single-arch (to both registries)
-        uses: docker/build-push-action@v7
+      - name: Build and push single-arch image
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
           tags: |
-            looplj/axonhub:${{ env.TAG }}-${{ matrix.arch }}
-            looplj/axonhub:latest-${{ matrix.arch }}
-          labels: ${{ steps.meta.outputs.labels }}
+            ghcr.io/${{ needs.compute-version.outputs.owner_lc }}/axonhub:${{ needs.compute-version.outputs.date_tag }}-${{ matrix.arch }}
+            ghcr.io/${{ needs.compute-version.outputs.owner_lc }}/axonhub:${{ needs.compute-version.outputs.sha_tag }}-${{ matrix.arch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
           sbom: false
 
-  create_manifests:
-    name: Create multi-arch manifests (Docker Hub)
-    needs: [build_single_arch]
+  create-manifest:
+    name: Create multi-arch manifests
+    needs: [compute-version, build]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Extract tag
-        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ needs.compute-version.outputs.actor_lc }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create & push manifest (Docker Hub - version)
+      - name: Create and push date manifest
         run: |
+          IMAGE="ghcr.io/${{ needs.compute-version.outputs.owner_lc }}/axonhub"
           docker buildx imagetools create \
-            -t looplj/axonhub:${TAG} \
-            looplj/axonhub:${TAG}-amd64 \
-            looplj/axonhub:${TAG}-arm64
+            -t "${IMAGE}:${{ needs.compute-version.outputs.date_tag }}" \
+            "${IMAGE}:${{ needs.compute-version.outputs.date_tag }}-amd64" \
+            "${IMAGE}:${{ needs.compute-version.outputs.date_tag }}-arm64"
 
-      - name: Create & push manifest (Docker Hub - latest)
+      - name: Create and push commit manifest
         run: |
+          IMAGE="ghcr.io/${{ needs.compute-version.outputs.owner_lc }}/axonhub"
           docker buildx imagetools create \
-            -t looplj/axonhub:latest \
-            looplj/axonhub:latest-amd64 \
-            looplj/axonhub:latest-arm64
+            -t "${IMAGE}:${{ needs.compute-version.outputs.sha_tag }}" \
+            "${IMAGE}:${{ needs.compute-version.outputs.sha_tag }}-amd64" \
+            "${IMAGE}:${{ needs.compute-version.outputs.sha_tag }}-arm64"
+
+      - name: Move unstable manifest tag
+        run: |
+          IMAGE="ghcr.io/${{ needs.compute-version.outputs.owner_lc }}/axonhub"
+          docker buildx imagetools create \
+            -t "${IMAGE}:unstable" \
+            "${IMAGE}:${{ needs.compute-version.outputs.sha_tag }}-amd64" \
+            "${IMAGE}:${{ needs.compute-version.outputs.sha_tag }}-arm64"
